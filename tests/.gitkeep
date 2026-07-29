@@ -1,0 +1,4 @@
+# Test placeholder
+# Unit tests for detect_secrets.py would live here.
+# Kept minimal for assessment scope — see scripts/secret-detection/test-data/
+# for functional test cases exercised directly against the scanner.

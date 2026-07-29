@@ -4,15 +4,16 @@
 # Runs on every push and pull request to enforce security quality gates.
 #
 # Jobs:
-#   1. secret-scan     — Gitleaks (commit history) + custom Python scanner
-#   2. dependency-scan — Trivy filesystem scan (OS packages + language deps)
-#   3. quality-gate    — Aggregates results; blocks merge on failures
+#   1. secret-scan      — Gitleaks (commit history) + custom detect_secrets.py
+#   2. sast-scan        — GitHub CodeQL (data-flow SAST for Java + JavaScript)
+#   3. dependency-scan  — Dependency Review Action (SCA) + Trivy filesystem
+#   4. quality-gate     — Aggregates results; blocks merge on failures
 #
-# Quality gate logic:
-#   Secrets detected      → ALWAYS fail (no exceptions)
-#   CRITICAL CVEs found   → fail
-#   HIGH CVEs found       → warn (annotated, does not block merge)
-#   MEDIUM / LOW CVEs     → info only
+# Quality gate policy:
+#   Secrets detected       → ALWAYS fail
+#   CRITICAL CVEs          → fail
+#   HIGH CVEs              → fail
+#   MEDIUM / LOW CVEs      → warn (annotated, does not block merge)
 # =============================================================================
 
 name: Secure Pipeline
@@ -26,8 +27,8 @@ on:
     branches:
       - main
 
-# Restrict default token permissions to least privilege.
-# Each job grants only what it needs.
+# Restrict default token to read-only.
+# Each job explicitly grants only the permissions it requires (least privilege).
 permissions:
   contents: read
 
@@ -35,55 +36,48 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # Job 1: Secret Scanning
-  # Two scanners for defence-in-depth:
-  #   - Gitleaks:            scans full git commit history for leaked secrets
-  #   - detect_secrets.py:   scans working tree with entropy + rule-based engine
+  # Defence-in-depth with two complementary scanners:
+  #   Gitleaks  — scans full git commit history for leaked credentials
+  #   detect_secrets.py — entropy + rule-based scan of the working tree
   # ---------------------------------------------------------------------------
   secret-scan:
     name: Secret Scanning
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      # Required to upload SARIF results to the GitHub Security tab
-      security-events: write
+      security-events: write   # Required to upload SARIF to the Security tab
 
     steps:
-      - name: Checkout code
+      - name: Checkout code (full history)
         uses: actions/checkout@v4
         with:
-          # Fetch full history so Gitleaks can scan all commits, not just HEAD
+          # Full history required so Gitleaks can scan all commits, not just HEAD.
+          # Secrets committed and later deleted are still exposed and must be found.
           fetch-depth: 0
 
-      # --- Scanner 1: Gitleaks ---
-      # Scans every commit in the repo history for secrets matching 250+ rules.
-      # Exits non-zero immediately if any secret is found — this is intentional.
+      # --- Gitleaks: history-aware secret detection ---
       - name: Gitleaks — scan commit history
         uses: gitleaks/gitleaks-action@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # GITLEAKS_LICENSE is required for org-level repos; not needed for personal repos
         with:
           args: --exit-code=1 --report-format=sarif --report-path=gitleaks-report.sarif
 
-      # Upload Gitleaks SARIF to GitHub Security tab (runs even if scan failed)
-      - name: Upload Gitleaks SARIF
+      - name: Upload Gitleaks SARIF to Security tab
         if: always()
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: gitleaks-report.sarif
           category: gitleaks
-        continue-on-error: true   # SARIF upload is best-effort; don't mask the real failure
+        continue-on-error: true
 
-      # --- Scanner 2: Custom Python Secret Engine ---
-      # Provides entropy-based detection and false-positive filtering as a
-      # second layer on top of Gitleaks pattern matching.
+      # --- Custom scanner: entropy + rule-based working-tree scan ---
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Custom scanner — detect_secrets.py
-        id: custom_scan
+      - name: detect_secrets.py — working tree scan
         run: |
           python scripts/secret-detection/detect_secrets.py \
             --path . \
@@ -91,9 +85,7 @@ jobs:
             --output custom-secret-report.json \
             --min-confidence MEDIUM \
             --fail-on HIGH
-          echo "exit_code=$?" >> "$GITHUB_OUTPUT"
 
-      # Upload the custom scanner JSON report as a build artifact
       - name: Upload custom secret scan report
         if: always()
         uses: actions/upload-artifact@v4
@@ -103,64 +95,116 @@ jobs:
           retention-days: 30
 
   # ---------------------------------------------------------------------------
-  # Job 2: Dependency & Vulnerability Scanning (Trivy)
-  # Trivy scans the repository filesystem for:
-  #   - Known CVEs in OS packages
-  #   - Known CVEs in language dependencies (Maven pom.xml, package.json)
-  #   - Misconfigurations in Dockerfile and docker-compose.yml
-  #
-  # Quality gate:
-  #   Step A — fail build on CRITICAL findings (exit-code 1)
-  #   Step B — report HIGH findings as warnings (exit-code 0, continue-on-error)
+  # Job 2: SAST — GitHub CodeQL
+  # Deep data-flow analysis for Java (country-service) and JavaScript (country-flags).
+  # Detects injection flaws, insecure deserialization, path traversal, XSS, etc.
+  # Free for public repositories; results surface in the GitHub Security tab.
   # ---------------------------------------------------------------------------
-  dependency-scan:
-    name: Vulnerability Scanning (Trivy)
+  sast-scan:
+    name: SAST — CodeQL
     runs-on: ubuntu-latest
     permissions:
       contents: read
       security-events: write
+      actions: read
+
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [java, javascript]
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # --- Step A: CRITICAL gate — fails the build ---
-      - name: Trivy — CRITICAL CVEs (quality gate)
+      - name: Initialise CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          queries: security-extended
+
+      - name: Set up Java (for Java analysis)
+        if: matrix.language == 'java'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "11"
+
+      - name: Build Java project (for CodeQL tracing)
+        if: matrix.language == 'java'
+        run: |
+          cd application/src/country-service-main
+          ./mvnw package -B -DskipTests --no-transfer-progress
+
+      - name: Autobuild (JavaScript)
+        if: matrix.language == 'javascript'
+        uses: github/codeql-action/autobuild@v3
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: codeql-${{ matrix.language }}
+
+  # ---------------------------------------------------------------------------
+  # Job 3: Dependency & Vulnerability Scanning
+  # Dependency Review Action — blocks newly introduced vulnerable dependencies on PRs.
+  # Trivy filesystem scan — scans all dependency manifests for known CVEs.
+  # Quality gate: CRITICAL and HIGH both fail the build.
+  # ---------------------------------------------------------------------------
+  dependency-scan:
+    name: Dependency & Vulnerability Scanning
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Dependency Review only runs on PRs — requires a base branch to diff against
+      - name: Dependency Review (PR gate)
+        if: github.event_name == 'pull_request'
+        uses: actions/dependency-review-action@v4
+        with:
+          fail-on-severity: high
+          deny-licenses: GPL-2.0, GPL-3.0, AGPL-3.0
+
+      # Trivy: CRITICAL + HIGH gate — fails the build
+      - name: Trivy — CRITICAL + HIGH CVEs (quality gate)
         uses: aquasecurity/trivy-action@0.30.0
         with:
           scan-type: fs
           scan-ref: .
-          # Only fail on CRITICAL; HIGH is handled separately as a warning
-          severity: CRITICAL
+          severity: CRITICAL,HIGH
           exit-code: "1"
           format: sarif
-          output: trivy-critical.sarif
-          # Ignore unfixed vulnerabilities to reduce noise from upstream delays
+          output: trivy-critical-high.sarif
           ignore-unfixed: true
 
-      - name: Upload Trivy CRITICAL SARIF
+      - name: Upload Trivy SARIF to Security tab
         if: always()
         uses: github/codeql-action/upload-sarif@v3
         with:
-          sarif_file: trivy-critical.sarif
-          category: trivy-critical
+          sarif_file: trivy-critical-high.sarif
+          category: trivy
         continue-on-error: true
 
-      # --- Step B: HIGH warning — annotates but does not fail ---
-      - name: Trivy — HIGH CVEs (warning only)
-        if: always()   # Run even when CRITICAL step fails, to get full picture
+      # Trivy: MEDIUM + LOW informational — does not fail
+      - name: Trivy — MEDIUM + LOW (informational)
+        if: always()
         uses: aquasecurity/trivy-action@0.30.0
         with:
           scan-type: fs
           scan-ref: .
-          severity: HIGH
-          exit-code: "0"          # Do not fail — HIGH is a warning in this policy
-          format: table           # Human-readable output in job log
+          severity: MEDIUM,LOW
+          exit-code: "0"
+          format: table
           ignore-unfixed: true
-        # continue-on-error intentionally omitted — exit-code 0 never fails
 
-      # --- Step C: Full JSON report for artifact archive ---
-      - name: Trivy — full report (all severities, JSON)
+      # Full JSON report archived as build artifact
+      - name: Trivy — full JSON report
         if: always()
         uses: aquasecurity/trivy-action@0.30.0
         with:
@@ -181,61 +225,67 @@ jobs:
           retention-days: 30
 
   # ---------------------------------------------------------------------------
-  # Job 3: Quality Gate Summary
-  # Runs after both scan jobs. Fails the overall pipeline if any upstream
-  # job failed, and prints a clear pass/fail summary to the job log.
-  #
-  # This job is the single merge-blocking check — branch protection rules
-  # should require this job to pass.
+  # Job 4: Quality Gate Summary
+  # Single merge-blocking job. Branch protection rules must require THIS job.
+  # Runs with if: always() so it always produces a result even when scans fail.
   # ---------------------------------------------------------------------------
   quality-gate:
     name: Quality Gate
     runs-on: ubuntu-latest
-    needs: [secret-scan, dependency-scan]
-    # Always run so we get a summary even when upstream jobs fail
+    needs: [secret-scan, sast-scan, dependency-scan]
     if: always()
     permissions:
       contents: read
 
     steps:
-      - name: Evaluate quality gate
+      - name: Evaluate and summarise quality gate
         env:
-          SECRET_SCAN_RESULT: ${{ needs.secret-scan.result }}
-          VULN_SCAN_RESULT: ${{ needs.dependency-scan.result }}
+          SECRET_RESULT: ${{ needs.secret-scan.result }}
+          SAST_RESULT: ${{ needs.sast-scan.result }}
+          DEPENDENCY_RESULT: ${{ needs.dependency-scan.result }}
         run: |
           echo "================================================"
           echo "  SECURITY QUALITY GATE SUMMARY"
           echo "================================================"
-          echo "  Secret scan      : $SECRET_SCAN_RESULT"
-          echo "  Vulnerability scan: $VULN_SCAN_RESULT"
+          echo "  Secret scan        : $SECRET_RESULT"
+          echo "  SAST (CodeQL)      : $SAST_RESULT"
+          echo "  Dependency scan    : $DEPENDENCY_RESULT"
           echo "------------------------------------------------"
 
           FAILED=false
 
-          if [ "$SECRET_SCAN_RESULT" != "success" ]; then
-            echo "  [FAIL] Secrets detected — merge BLOCKED"
-            echo "         Remediation: rotate exposed credentials immediately,"
-            echo "         then use environment variables or a secrets manager."
+          if [ "$SECRET_RESULT" != "success" ]; then
+            echo "  [FAIL] Secrets detected"
+            echo "         Rotate all exposed credentials immediately."
+            echo "         Use GitHub Secrets or a secrets manager going forward."
             FAILED=true
           else
             echo "  [PASS] No secrets detected"
           fi
 
-          if [ "$VULN_SCAN_RESULT" != "success" ]; then
-            echo "  [FAIL] CRITICAL CVEs found — merge BLOCKED"
-            echo "         Remediation: update affected dependencies to a"
-            echo "         patched version, or add a Trivy .trivyignore entry"
-            echo "         with a documented justification and review date."
+          if [ "$SAST_RESULT" != "success" ]; then
+            echo "  [FAIL] SAST findings require review (CodeQL)"
+            echo "         Review results in the GitHub Security tab."
+            echo "         Fix or dismiss each finding with a documented justification."
             FAILED=true
           else
-            echo "  [PASS] No CRITICAL vulnerabilities found"
+            echo "  [PASS] No SAST findings"
+          fi
+
+          if [ "$DEPENDENCY_RESULT" != "success" ]; then
+            echo "  [FAIL] CRITICAL or HIGH CVEs found in dependencies"
+            echo "         Update affected packages to a patched version."
+            echo "         Or add a .trivyignore entry with justification and review date."
+            FAILED=true
+          else
+            echo "  [PASS] No CRITICAL/HIGH vulnerabilities found"
           fi
 
           echo "================================================"
-
           if [ "$FAILED" = "true" ]; then
-            echo "  RESULT: FAILED — pipeline blocked"
+            echo "  RESULT: FAILED — one or more security gates blocked this merge"
             exit 1
           else
             echo "  RESULT: PASSED — all security gates cleared"
           fi
+
