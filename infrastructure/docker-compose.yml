@@ -1,0 +1,138 @@
+# =============================================================================
+# Secure Docker Compose — country-service
+# =============================================================================
+#
+# Security hardening applied at the container runtime level.
+# These controls are independent of the Dockerfile and apply even if the
+# image itself has vulnerabilities.
+#
+# To start:  docker compose up -d
+# To stop:   docker compose down
+#
+# Required: create a .env file (see .env.example) before starting.
+# NEVER commit .env to version control.
+# =============================================================================
+
+services:
+  country-service:
+    build:
+      context: ..               # Repo root — Dockerfile COPYs from application/src/
+      dockerfile: application/Dockerfile
+
+    image: country-service:latest
+
+    container_name: country-service
+
+    # -------------------------------------------------------------------------
+    # Runtime security controls
+    # -------------------------------------------------------------------------
+
+    # Run as the non-root user defined in the Dockerfile (UID 1001).
+    # Overriding here ensures the constraint is enforced even if the image
+    # is replaced with one that sets a different USER.
+    user: "1001:1001"
+
+    # Drop ALL Linux capabilities, then add back only what is strictly needed.
+    # Spring Boot on port 8080 (>1024) does not need NET_BIND_SERVICE.
+    # A Java app serving HTTP needs no capabilities at all.
+    cap_drop:
+      - ALL
+
+    # Prevent the process from gaining additional privileges via setuid/setgid
+    # binaries inside the container.
+    security_opt:
+      - no-new-privileges:true
+
+    # Mount the root filesystem read-only.
+    # The application cannot write to / even if compromised.
+    # Writable paths are explicitly whitelisted below via tmpfs.
+    read_only: true
+
+    # Provide writable tmpfs mounts for paths the JVM and Spring Boot need.
+    # tmpfs is memory-only — nothing persists to disk after container stops.
+    tmpfs:
+      - /tmp:size=64m,mode=1777      # JVM temporary files
+      - /app/logs:size=32m,mode=0750  # Application logs (if file appender is used)
+
+    # Disable inter-container communication by default.
+    # Only allow traffic on explicitly defined networks.
+    # (docker compose sets this automatically when a custom network is defined)
+
+    # -------------------------------------------------------------------------
+    # Network
+    # -------------------------------------------------------------------------
+    ports:
+      # Map host port 8080 to container port 8080.
+      # In production, replace with a reverse proxy (nginx/traefik) and
+      # bind only to 127.0.0.1: "127.0.0.1:8080:8080"
+      - "8080:8080"
+
+    networks:
+      - backend
+
+    # -------------------------------------------------------------------------
+    # Resource limits
+    # -------------------------------------------------------------------------
+    # Prevent a compromised container from consuming all host resources
+    # (a basic denial-of-service mitigation).
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+        reservations:
+          cpus: "0.25"
+          memory: 256M
+
+    # -------------------------------------------------------------------------
+    # Environment — injected from .env file, NOT hardcoded here
+    # -------------------------------------------------------------------------
+    # Secrets must NEVER appear in this file. Add them to .env (gitignored).
+    # See .env.example for required variables.
+    environment:
+      - SPRING_PROFILES_ACTIVE=${SPRING_PROFILES_ACTIVE:-default}
+      - SERVER_PORT=8080
+      # Database credentials sourced from .env — never hardcoded
+      - SPRING_DATASOURCE_URL=${SPRING_DATASOURCE_URL:-}
+      - SPRING_DATASOURCE_USERNAME=${SPRING_DATASOURCE_USERNAME:-}
+      - SPRING_DATASOURCE_PASSWORD=${SPRING_DATASOURCE_PASSWORD:-}
+
+    env_file:
+      - .env   # .env is gitignored — contains actual secret values
+
+    # -------------------------------------------------------------------------
+    # Health check
+    # -------------------------------------------------------------------------
+    # Compose will mark the container unhealthy and optionally restart it.
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:8080/actuator/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s    # Give Spring Boot time to start before first check
+
+    # Restart on failure but not on explicit docker compose stop
+    restart: unless-stopped
+
+    # -------------------------------------------------------------------------
+    # Logging
+    # -------------------------------------------------------------------------
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"    # Prevent log files from filling the disk
+        max-file: "3"
+
+# =============================================================================
+# Networks
+# =============================================================================
+networks:
+  backend:
+    # Use an isolated bridge network.
+    # Containers on this network can reach each other by service name,
+    # but are isolated from the default Docker bridge.
+    driver: bridge
+    # Disable ICC (inter-container communication) — containers must explicitly
+    # be on the same network to communicate.
+    driver_opts:
+      com.docker.network.bridge.enable_icc: "false"
