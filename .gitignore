@@ -1,0 +1,40 @@
+# Build artefacts
+target/
+build/
+dist/
+out/
+*.class
+*.jar
+*.war
+
+# Node
+node_modules/
+npm-debug.log*
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Scan reports (generated - do not commit)
+scripts/secret-detection/reports/
+secret-scan-report.json
+trivy-results*.json
+gitleaks-report.json
+
+# Secrets - never commit
+.env
+.env.local
+.env.production
+*.pem
+*.key
+*.p12
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# Gradle
+.gradle/

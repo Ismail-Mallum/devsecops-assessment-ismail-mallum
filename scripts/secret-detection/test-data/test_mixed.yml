@@ -1,0 +1,38 @@
+# Test Case 3: YAML configuration file — mixed real secrets and safe references
+# Expected findings: HARDCODED_PASSWORD (HIGH), JWT_TOKEN (HIGH)
+# Expected safe (no finding): entries using environment variable substitution
+
+spring:
+  application:
+    name: country-service
+
+  datasource:
+    # SAFE: uses Spring environment variable substitution — no hardcoded credential
+    url: ${DATASOURCE_URL:jdbc:postgresql://localhost:5432/countries}
+    username: ${DB_USER:appuser}
+    # BAD: password directly in YAML — should use ${DB_PASSWORD} or a secrets manager
+    password: "Tr0ub4dor&3"
+
+  security:
+    # SAFE: references an environment variable
+    oauth2:
+      client:
+        registration:
+          github:
+            client-secret: ${GITHUB_OAUTH_SECRET}
+
+# BAD: JWT signing secret hardcoded — anyone with repo access can forge tokens
+jwt:
+  signing-key: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJhZG1pbiIsImlzcyI6ImNvdW50cnktc2VydmljZSJ9.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
+  expiry-seconds: 3600
+
+# SAFE: non-sensitive configuration values
+server:
+  port: 8080
+  compression:
+    enabled: true
+
+logging:
+  level:
+    root: INFO
+    com.example: DEBUG
