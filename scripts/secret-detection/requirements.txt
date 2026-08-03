@@ -1,0 +1,8 @@
+# No runtime dependencies required.
+# detect_secrets.py uses Python 3.11+ standard library only.
+#
+# This is an intentional security decision: a secret scanner with third-party
+# dependencies introduces supply-chain risk — a compromised dependency could
+# suppress findings or exfiltrate detected secrets.
+#
+# Required: Python >= 3.11
